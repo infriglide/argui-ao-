@@ -1,0 +1,105 @@
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/pwm.h>
+
+// Tempo de amostragem/atualização do loop
+#define SLEEP_TIME_MS 10
+
+// --- Configuração do PWM para os Motores ---
+// Substitua pelos aliases corretos do seu devicetree (ex: pwm_motor_esq, etc.)
+static const struct pwm_dt_spec motor_esq = PWM_DT_SPEC_GET(DT_ALIAS(motor_esq_pwm));
+static const struct pwm_dt_spec motor_dir = PWM_DT_SPEC_GET(DT_ALIAS(motor_dir_pwm));
+
+// --- Configuração dos Motores (Direção/Sentido de Rotação) ---
+static const struct gpio_dt_spec dir_esq = GPIO_DT_SPEC_GET(DT_ALIAS(dir_esq_gpio), gpios);
+static const struct gpio_dt_spec dir_dir = GPIO_DT_SPEC_GET(DT_ALIAS(dir_dir_gpio), gpios);
+
+// --- Configuração dos Sensores (GPIO Input) ---
+static const struct gpio_dt_spec gus = GPIO_DT_SPEC_GET(DT_ALIAS(sensor_gus), gpios);
+static const struct gpio_dt_spec ta  = GPIO_DT_SPEC_GET(DT_ALIAS(sensor_ta), gpios);
+static const struct gpio_dt_spec vo  = GPIO_DT_SPEC_GET(DT_ALIAS(sensor_vo), gpios);
+
+// --- Definição das Velocidades baseadas no Período do PWM ---
+// yu = Máximo (80% do período), tsu = Mínimo (20% do período)
+#define YU_DUTY(period)  ((period * 80) / 100)
+#define TSU_DUTY(period) ((period * 20) / 100)
+
+// --- Estados do Carrinho ---
+enum estado_carrinho {
+    RETO,
+    ESQUERDA,
+    DIREITA,
+    BUSCA
+};
+
+int main(void)
+{
+    // Verifica se os dispositivos PWM estão prontos
+    if (!pwm_is_ready_dt(&motor_esq) || !pwm_is_ready_dt(&motor_dir)) {
+        return 0;
+    }
+
+    // Configura os pinos de direção e sensores
+    gpio_pin_configure_dt(&dir_esq, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_configure_dt(&dir_dir, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_configure_dt(&gus, GPIO_INPUT);
+    gpio_pin_configure_dt(&ta, GPIO_INPUT);
+    gpio_pin_configure_dt(&vo, GPIO_INPUT);
+
+    // Guarda o período configurado no Devicetree para o cálculo do Duty Cycle
+    uint32_t period_esq = motor_esq.period;
+    uint32_t period_dir = motor_dir.period;
+
+    enum estado_carrinho estado_atual = BUSCA;
+
+    while (1) {
+        // 1. Leitura dos Sensores
+        int l_gus = gpio_pin_get_dt(&gus);
+        int l_ta  = gpio_pin_get_dt(&ta);
+        int l_vo  = gpio_spec_get_dt(&vo);
+
+        // 2. Máquina de Estados para determinar a direção
+        if (l_ta == 1 && l_gus == 0 && l_vo == 0) {
+            estado_atual = RETO;
+        } else if (l_gus == 1) {
+            estado_atual = ESQUERDA;
+        } else if (l_vo == 1) {
+            estado_atual = DIREITA;
+        } else {
+            estado_atual = BUSCA;
+        }
+
+        // 3. Atuação nos Motores baseado no estado
+        switch (estado_atual) {
+            case RETO:
+                // Ambos os motores no máximo (yu)
+                pwm_set_dt(&motor_esq, period_esq, YU_DUTY(period_esq));
+                pwm_set_dt(&motor_dir, period_dir, YU_DUTY(period_dir));
+                break;
+
+            case ESQUERDA:
+                // Motor esquerdo no mínimo (tsu), motor direito no máximo (yu)
+                pwm_set_dt(&motor_esq, period_esq, TSU_DUTY(period_esq));
+                pwm_set_dt(&motor_dir, period_dir, YU_DUTY(period_dir));
+                break;
+
+            case DIREITA:
+                // Motor esquerdo no máximo (yu), motor direito no mínimo (tsu)
+                pwm_set_dt(&motor_esq, period_esq, YU_DUTY(period_esq));
+                pwm_set_dt(&motor_dir, period_dir, TSU_DUTY(period_dir));
+                break;
+
+            case BUSCA:
+                // Ambos os motores no mínimo (tsu) procurando a linha
+                pwm_set_dt(&motor_esq, period_esq, TSU_DUTY(period_esq));
+                pwm_set_dt(&motor_dir, period_dir, TSU_DUTY(period_dir));
+                break;
+        }
+
+        // Tempo de espera do Zephyr para a próxima iteração
+        k_msleep(SLEEP_TIME_MS);
+    }
+
+    return 0;
+}
